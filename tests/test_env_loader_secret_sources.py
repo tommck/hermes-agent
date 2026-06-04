@@ -173,3 +173,121 @@ def test_apply_external_secret_sources_dedupes_within_process(tmp_path, monkeypa
     env_loader.reset_secret_source_cache()
     env_loader._apply_external_secret_sources(tmp_path)
     assert call_count["n"] == 2
+
+
+def test_vault_loaded_when_bsm_disabled(tmp_path, monkeypatch):
+    """bitwarden_vault must be pulled even when bitwarden (BSM) is disabled.
+
+    This is the gateway-with-Matrix scenario: BSM is disabled, vault is
+    enabled, and Matrix secrets live in the vault.  The previous early-return
+    on ``not bw_cfg.get("enabled")`` silently skipped the vault entirely.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: false\n"
+        "  bitwarden_vault:\n"
+        "    enabled: true\n"
+        "    email: user@example.com\n"
+        "    folder_name: hermes\n",
+        encoding="utf-8",
+    )
+
+    from agent.secret_sources.bitwarden_vault import FetchResult as VaultFetchResult
+
+    fake_result = VaultFetchResult(
+        secrets={"MATRIX_ACCESS_TOKEN": "syt_fake_token"},
+        applied=["MATRIX_ACCESS_TOKEN"],
+    )
+
+    def _fake_apply(**_kwargs):
+        return fake_result
+
+    import agent.secret_sources.bitwarden_vault as bwv_module
+    monkeypatch.setattr(bwv_module, "apply_vault_secrets", _fake_apply)
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert env_loader.get_secret_source("MATRIX_ACCESS_TOKEN") == "bitwarden_vault"
+    assert (
+        env_loader.format_secret_source_suffix("MATRIX_ACCESS_TOKEN")
+        == " (from Bitwarden Vault)"
+    )
+
+
+def test_vault_source_label_tracked(tmp_path, monkeypatch):
+    """Keys applied from the vault are labelled 'bitwarden_vault' in source map."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  bitwarden_vault:\n"
+        "    enabled: true\n"
+        "    email: user@example.com\n",
+        encoding="utf-8",
+    )
+
+    from agent.secret_sources.bitwarden_vault import FetchResult as VaultFetchResult
+
+    fake_result = VaultFetchResult(
+        secrets={
+            "MATRIX_ACCESS_TOKEN": "syt_tok",
+            "MATRIX_HOMESERVER": "https://matrix.example.org",
+        },
+        applied=["MATRIX_ACCESS_TOKEN", "MATRIX_HOMESERVER"],
+    )
+
+    import agent.secret_sources.bitwarden_vault as bwv_module
+    monkeypatch.setattr(bwv_module, "apply_vault_secrets", lambda **_: fake_result)
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert env_loader.get_secret_source("MATRIX_ACCESS_TOKEN") == "bitwarden_vault"
+    assert env_loader.get_secret_source("MATRIX_HOMESERVER") == "bitwarden_vault"
+    # BSM keys remain unlabelled
+    assert env_loader.get_secret_source("ANTHROPIC_API_KEY") is None
+
+
+def test_bsm_and_vault_both_run_when_both_enabled(tmp_path, monkeypatch):
+    """Both BSM and vault are called independently when both enabled."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: proj\n"
+        "    access_token_env: BWS_ACCESS_TOKEN\n"
+        "  bitwarden_vault:\n"
+        "    enabled: true\n"
+        "    email: user@example.com\n",
+        encoding="utf-8",
+    )
+
+    from agent.secret_sources.bitwarden import FetchResult
+    from agent.secret_sources.bitwarden_vault import FetchResult as VaultFetchResult
+
+    bsm_calls = {"n": 0}
+    vault_calls = {"n": 0}
+
+    def _fake_bsm(**_):
+        bsm_calls["n"] += 1
+        return FetchResult(secrets={"OPENAI_API_KEY": "sk-bsm"}, applied=["OPENAI_API_KEY"])
+
+    def _fake_vault(**_):
+        vault_calls["n"] += 1
+        return VaultFetchResult(secrets={"MATRIX_ACCESS_TOKEN": "syt_tok"}, applied=["MATRIX_ACCESS_TOKEN"])
+
+    import agent.secret_sources.bitwarden as bw_module
+    import agent.secret_sources.bitwarden_vault as bwv_module
+    monkeypatch.setattr(bw_module, "apply_bitwarden_secrets", _fake_bsm)
+    monkeypatch.setattr(bwv_module, "apply_vault_secrets", _fake_vault)
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert bsm_calls["n"] == 1
+    assert vault_calls["n"] == 1
+    assert env_loader.get_secret_source("OPENAI_API_KEY") == "bitwarden"
+    assert env_loader.get_secret_source("MATRIX_ACCESS_TOKEN") == "bitwarden_vault"
