@@ -481,6 +481,9 @@ def _get_session_token(
     server_url: str = "",
     identity_url: str = "",
     api_url: str = "",
+    ca_cert: str = "",
+    insecure_tls: bool = False,
+    use_system_ca: bool = False,
 ) -> str:
     """Unlock the vault and return a session token.
 
@@ -493,12 +496,14 @@ def _get_session_token(
             "Master password not found. Run `hermes secrets bitwarden-vault setup`."
         )
 
+    tls_env = _tls_env_vars(ca_cert, insecure_tls, use_system_ca)
+
     # Configure server if needed
     if server_url:
-        _configure_server(bw, server_url, identity_url, api_url)
+        _configure_server(bw, server_url, identity_url, api_url, tls_env)
 
     # Check login status first
-    status = _check_status(bw)
+    status = _check_status(bw, tls_env)
     if status.get("status") == "unauthenticated":
         raise RuntimeError(
             "Not logged in to Bitwarden. Run `hermes secrets bitwarden-vault setup`."
@@ -512,7 +517,7 @@ def _get_session_token(
             f.write(master_password)
         os.chmod(pw_file, 0o600)
 
-        proc = _run_bw(bw, ["unlock", "--passwordfile", pw_file])
+        proc = _run_bw(bw, ["unlock", "--passwordfile", pw_file], env_extra=tls_env)
     finally:
         try:
             os.unlink(pw_file)
@@ -536,20 +541,23 @@ def _configure_server(
     server_url: str,
     identity_url: str = "",
     api_url: str = "",
+    tls_env: Optional[Dict[str, str]] = None,
 ) -> None:
     """Set the bw server configuration for self-hosted instances."""
     args = ["config", "server", server_url]
-    proc = _run_bw(bw, args)
+    proc = _run_bw(bw, args, env_extra=tls_env or {})
     if proc.returncode != 0:
         logger.warning("bw config server failed: %s", proc.stderr.strip()[:100])
 
 
-def _check_status(bw: Path) -> dict:
+def _check_status(bw: Path, tls_env: Optional[Dict[str, str]] = None) -> dict:
     """Run bw status and return the parsed JSON."""
     # bw status doesn't use --raw well, use --output json equivalent
     cmd = [str(bw), "status", "--nointeraction"]
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    if tls_env:
+        env.update(tls_env)
     try:
         proc = subprocess.run(
             cmd, env=env, capture_output=True, text=True, timeout=_BW_RUN_TIMEOUT
@@ -563,18 +571,26 @@ def _check_status(bw: Path) -> dict:
         return {}
 
 
-def _sync_vault(bw: Path, session: str) -> None:
+def _sync_vault(
+    bw: Path, session: str, tls_env: Optional[Dict[str, str]] = None
+) -> None:
     """Sync the local vault cache with the server."""
-    proc = _run_bw(bw, ["sync"], session=session, timeout=_BW_SYNC_TIMEOUT)
+    proc = _run_bw(
+        bw, ["sync"], session=session, timeout=_BW_SYNC_TIMEOUT, env_extra=tls_env or {}
+    )
     if proc.returncode != 0:
         logger.warning("bw sync failed (non-fatal): %s", proc.stderr.strip()[:100])
 
 
-def _list_folders(bw: Path, session: str) -> List[dict]:
+def _list_folders(
+    bw: Path, session: str, tls_env: Optional[Dict[str, str]] = None
+) -> List[dict]:
     """List all folders in the vault."""
     cmd = [str(bw), "list", "folders", "--nointeraction", "--session", session]
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    if tls_env:
+        env.update(tls_env)
 
     try:
         proc = subprocess.run(
@@ -594,9 +610,14 @@ def _list_folders(bw: Path, session: str) -> List[dict]:
     return folders if isinstance(folders, list) else []
 
 
-def _find_folder_id(bw: Path, session: str, folder_name: str) -> Optional[str]:
+def _find_folder_id(
+    bw: Path,
+    session: str,
+    folder_name: str,
+    tls_env: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Find the folder ID for the given folder name."""
-    folders = _list_folders(bw, session)
+    folders = _list_folders(bw, session, tls_env)
     for folder in folders:
         if isinstance(folder, dict) and folder.get("name") == folder_name:
             return folder.get("id")
@@ -604,7 +625,11 @@ def _find_folder_id(bw: Path, session: str, folder_name: str) -> Optional[str]:
 
 
 def _list_items_in_folder(
-    bw: Path, session: str, folder_id: str, org_id: str = ""
+    bw: Path,
+    session: str,
+    folder_id: str,
+    org_id: str = "",
+    tls_env: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
     """List items in a specific folder."""
     cmd = [
@@ -622,6 +647,8 @@ def _list_items_in_folder(
 
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    if tls_env:
+        env.update(tls_env)
 
     try:
         proc = subprocess.run(
@@ -664,6 +691,31 @@ def _is_valid_env_name(name: str) -> bool:
     return bool(_ENV_NAME_RE.match(name))
 
 
+def _tls_env_vars(
+    ca_cert: str = "",
+    insecure_tls: bool = False,
+    use_system_ca: bool = False,
+) -> Dict[str, str]:
+    """Return env var additions to configure TLS for the bw (Node.js) CLI.
+
+    ``ca_cert`` — path to a PEM CA certificate (for self-signed / internal CAs).
+    ``insecure_tls`` — disable TLS verification entirely (not recommended).
+    ``use_system_ca`` — pass ``--use-system-ca`` to Node (Node 24+); trusts
+        any certificate already installed in the OS trust store.
+    """
+    extra: Dict[str, str] = {}
+    if ca_cert:
+        extra["NODE_EXTRA_CA_CERTS"] = ca_cert
+    if insecure_tls:
+        extra["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+    if use_system_ca:
+        existing = extra.get("NODE_OPTIONS", "")
+        extra["NODE_OPTIONS"] = (
+            (existing + " --use-system-ca").strip()
+        )
+    return extra
+
+
 def _email_fingerprint(email: str) -> str:
     """SHA-256 prefix of email for cache key — never logged."""
     return hashlib.sha256(email.encode("utf-8")).hexdigest()[:16]
@@ -687,6 +739,9 @@ def fetch_vault_secrets(
     org_id: str = "",
     home_path: Optional[Path] = None,
     password_storage: str = "auto",
+    ca_cert: str = "",
+    insecure_tls: bool = False,
+    use_system_ca: bool = False,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from the Bitwarden Vault folder.
 
@@ -714,14 +769,16 @@ def fetch_vault_secrets(
 
     # Get session token
     session = _get_session_token(
-        bw, email, password_storage, home_path, server_url, identity_url, api_url
+        bw, email, password_storage, home_path, server_url, identity_url, api_url,
+        ca_cert, insecure_tls, use_system_ca,
     )
 
     # Sync vault
-    _sync_vault(bw, session)
+    tls_env = _tls_env_vars(ca_cert, insecure_tls, use_system_ca)
+    _sync_vault(bw, session, tls_env)
 
     # Find the folder
-    folder_id = _find_folder_id(bw, session, folder_name)
+    folder_id = _find_folder_id(bw, session, folder_name, tls_env)
     if folder_id is None:
         raise RuntimeError(
             f"Folder '{folder_name}' not found in Bitwarden Vault. "
@@ -729,7 +786,7 @@ def fetch_vault_secrets(
         )
 
     # List items
-    items = _list_items_in_folder(bw, session, folder_id, org_id)
+    items = _list_items_in_folder(bw, session, folder_id, org_id, tls_env)
 
     secrets: Dict[str, str] = {}
     warnings: List[str] = []
@@ -774,6 +831,9 @@ def apply_vault_secrets(
     org_id: str = "",
     home_path: Optional[Path] = None,
     password_storage: str = "auto",
+    ca_cert: str = "",
+    insecure_tls: bool = False,
+    use_system_ca: bool = False,
 ) -> FetchResult:
     """Pull secrets from Bitwarden Vault and set them on ``os.environ``.
 
@@ -814,6 +874,9 @@ def apply_vault_secrets(
             org_id=org_id,
             home_path=home_path,
             password_storage=password_storage,
+            ca_cert=ca_cert,
+            insecure_tls=insecure_tls,
+            use_system_ca=use_system_ca,
         )
     except RuntimeError as exc:
         result.error = str(exc)

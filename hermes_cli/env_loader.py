@@ -345,6 +345,9 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                 org_id=str(bwv_cfg.get("org_id", "") or "").strip(),
                 home_path=home_path,
                 password_storage=str(bwv_cfg.get("password_storage", "auto") or "auto"),
+                ca_cert=str(bwv_cfg.get("ca_cert", "") or "").strip(),
+                insecure_tls=bool(bwv_cfg.get("insecure_tls", False)),
+                use_system_ca=bool(bwv_cfg.get("use_system_ca", False)),
             )
 
             if vault_result.applied:

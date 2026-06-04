@@ -581,7 +581,7 @@ def test_get_session_unauthenticated(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
     monkeypatch.setattr(
-        bv, "_check_status", lambda bw_bin: {"status": "unauthenticated"}
+        bv, "_check_status", lambda bw_bin, tls_env=None: {"status": "unauthenticated"}
     )
     monkeypatch.setattr(bv, "_configure_server", lambda *a, **kw: None)
 
@@ -855,3 +855,212 @@ def test_disk_cache_expires_with_ttl(monkeypatch, tmp_path):
         home_path=home,
     )
     assert unlock_calls["n"] == 2  # stale disk cache → refetch
+
+
+# ---------------------------------------------------------------------------
+# _tls_env_vars
+# ---------------------------------------------------------------------------
+
+
+def test_tls_env_vars_empty():
+    assert bv._tls_env_vars() == {}
+
+
+def test_tls_env_vars_ca_cert(tmp_path):
+    pem = tmp_path / "ca.pem"
+    pem.write_text("cert")
+    result = bv._tls_env_vars(ca_cert=str(pem))
+    assert result == {"NODE_EXTRA_CA_CERTS": str(pem)}
+
+
+def test_tls_env_vars_insecure():
+    result = bv._tls_env_vars(insecure_tls=True)
+    assert result == {"NODE_TLS_REJECT_UNAUTHORIZED": "0"}
+
+
+def test_tls_env_vars_use_system_ca():
+    result = bv._tls_env_vars(use_system_ca=True)
+    assert result == {"NODE_OPTIONS": "--use-system-ca"}
+
+
+def test_tls_env_vars_ca_cert_and_use_system_ca(tmp_path):
+    pem = tmp_path / "ca.pem"
+    pem.write_text("cert")
+    result = bv._tls_env_vars(ca_cert=str(pem), use_system_ca=True)
+    assert result["NODE_EXTRA_CA_CERTS"] == str(pem)
+    assert result["NODE_OPTIONS"] == "--use-system-ca"
+
+
+def test_tls_env_vars_all_three(tmp_path):
+    pem = tmp_path / "ca.pem"
+    pem.write_text("cert")
+    result = bv._tls_env_vars(
+        ca_cert=str(pem), insecure_tls=True, use_system_ca=True
+    )
+    assert result["NODE_EXTRA_CA_CERTS"] == str(pem)
+    assert result["NODE_TLS_REJECT_UNAUTHORIZED"] == "0"
+    assert "--use-system-ca" in result["NODE_OPTIONS"]
+
+
+def test_tls_env_vars_use_system_ca_appends_to_existing_node_options():
+    """use_system_ca should append to a pre-existing NODE_OPTIONS value."""
+    # Simulate a caller that already has NODE_OPTIONS set; _tls_env_vars itself
+    # starts from scratch, so two calls with different flags should compose.
+    r1 = bv._tls_env_vars(use_system_ca=True)
+    # The resulting value should not have leading/trailing spaces.
+    assert r1["NODE_OPTIONS"] == "--use-system-ca"
+    assert not r1["NODE_OPTIONS"].startswith(" ")
+
+
+# ---------------------------------------------------------------------------
+# TLS env vars pass-through via fetch_vault_secrets
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_passes_ca_cert_to_run_bw(monkeypatch, tmp_path):
+    """NODE_EXTRA_CA_CERTS must appear in every _run_bw call when ca_cert is set."""
+    pem = tmp_path / "ca.pem"
+    pem.write_text("cert")
+    fake_bin = tmp_path / "bw"
+    fake_bin.write_text("")
+    runner = FakeBwRunner()
+    observed_envs: list[dict] = []
+
+    def capturing_run_bw(bw_bin, args, **kw):
+        observed_envs.append(dict(kw.get("env_extra") or {}))
+        return runner([str(bw_bin)] + args)
+
+    monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
+    monkeypatch.setattr(bv, "_run_bw", capturing_run_bw)
+    monkeypatch.setattr(bv.subprocess, "run", runner)
+
+    bv.fetch_vault_secrets(
+        email="user@example.com",
+        binary=fake_bin,
+        use_cache=False,
+        ca_cert=str(pem),
+    )
+    assert observed_envs, "expected _run_bw to be called"
+    for env in observed_envs:
+        assert env.get("NODE_EXTRA_CA_CERTS") == str(pem), (
+            f"expected NODE_EXTRA_CA_CERTS in {env}"
+        )
+
+
+def test_fetch_passes_use_system_ca_to_run_bw(monkeypatch, tmp_path):
+    """NODE_OPTIONS=--use-system-ca must be set when use_system_ca=True."""
+    fake_bin = tmp_path / "bw"
+    fake_bin.write_text("")
+    runner = FakeBwRunner()
+    observed_envs: list[dict] = []
+
+    def capturing_run_bw(bw_bin, args, **kw):
+        observed_envs.append(dict(kw.get("env_extra") or {}))
+        return runner([str(bw_bin)] + args)
+
+    monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
+    monkeypatch.setattr(bv, "_run_bw", capturing_run_bw)
+    monkeypatch.setattr(bv.subprocess, "run", runner)
+
+    bv.fetch_vault_secrets(
+        email="user@example.com",
+        binary=fake_bin,
+        use_cache=False,
+        use_system_ca=True,
+    )
+    assert observed_envs
+    for env in observed_envs:
+        assert "--use-system-ca" in env.get("NODE_OPTIONS", ""), (
+            f"expected --use-system-ca in NODE_OPTIONS in {env}"
+        )
+
+
+def test_fetch_no_tls_env_when_defaults(monkeypatch, tmp_path):
+    """No TLS env vars should be injected when all TLS params are default."""
+    fake_bin = tmp_path / "bw"
+    fake_bin.write_text("")
+    runner = FakeBwRunner()
+    observed_envs: list[dict] = []
+
+    def capturing_run_bw(bw_bin, args, **kw):
+        observed_envs.append(dict(kw.get("env_extra") or {}))
+        return runner([str(bw_bin)] + args)
+
+    monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
+    monkeypatch.setattr(bv, "_run_bw", capturing_run_bw)
+    monkeypatch.setattr(bv.subprocess, "run", runner)
+
+    bv.fetch_vault_secrets(
+        email="user@example.com",
+        binary=fake_bin,
+        use_cache=False,
+    )
+    for env in observed_envs:
+        assert "NODE_EXTRA_CA_CERTS" not in env
+        assert "NODE_OPTIONS" not in env
+        assert "NODE_TLS_REJECT_UNAUTHORIZED" not in env
+
+
+# ---------------------------------------------------------------------------
+# apply_vault_secrets — TLS param pass-through
+# ---------------------------------------------------------------------------
+
+
+def test_apply_passes_use_system_ca(monkeypatch, tmp_path):
+    """use_system_ca=True must reach _run_bw as NODE_OPTIONS."""
+    fake_bin = tmp_path / "bw"
+    fake_bin.write_text("")
+    runner = FakeBwRunner()
+    observed_envs: list[dict] = []
+
+    def capturing_run_bw(bw_bin, args, **kw):
+        observed_envs.append(dict(kw.get("env_extra") or {}))
+        return runner([str(bw_bin)] + args)
+
+    monkeypatch.setattr(bv, "find_bw", lambda **kw: fake_bin)
+    monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
+    monkeypatch.setattr(bv, "_run_bw", capturing_run_bw)
+    monkeypatch.setattr(bv.subprocess, "run", runner)
+
+    result = bv.apply_vault_secrets(
+        enabled=True,
+        email="user@example.com",
+        auto_install=False,
+        use_system_ca=True,
+    )
+    assert result.ok
+    assert observed_envs
+    assert any(
+        "--use-system-ca" in e.get("NODE_OPTIONS", "") for e in observed_envs
+    ), f"expected --use-system-ca in at least one call, got: {observed_envs}"
+
+
+def test_apply_passes_ca_cert(monkeypatch, tmp_path):
+    """ca_cert path must reach _run_bw as NODE_EXTRA_CA_CERTS."""
+    pem = tmp_path / "ca.pem"
+    pem.write_text("cert")
+    fake_bin = tmp_path / "bw"
+    fake_bin.write_text("")
+    runner = FakeBwRunner()
+    observed_envs: list[dict] = []
+
+    def capturing_run_bw(bw_bin, args, **kw):
+        observed_envs.append(dict(kw.get("env_extra") or {}))
+        return runner([str(bw_bin)] + args)
+
+    monkeypatch.setattr(bv, "find_bw", lambda **kw: fake_bin)
+    monkeypatch.setattr(bv, "_read_master_password", lambda *a, **kw: "pw")
+    monkeypatch.setattr(bv, "_run_bw", capturing_run_bw)
+    monkeypatch.setattr(bv.subprocess, "run", runner)
+
+    result = bv.apply_vault_secrets(
+        enabled=True,
+        email="user@example.com",
+        auto_install=False,
+        ca_cert=str(pem),
+    )
+    assert result.ok
+    assert any(
+        e.get("NODE_EXTRA_CA_CERTS") == str(pem) for e in observed_envs
+    ), f"expected NODE_EXTRA_CA_CERTS in at least one call, got: {observed_envs}"
+

@@ -50,6 +50,21 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
         "--server-url",
         help="Self-hosted Bitwarden server URL (empty = cloud default)",
     )
+    setup.add_argument(
+        "--ca-cert",
+        help="Path to a PEM CA certificate for self-signed / internal TLS (e.g. for https://bitwarden.mycompany.local)",
+    )
+    setup.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate verification (not recommended; use --ca-cert instead)",
+    )
+    setup.add_argument(
+        "--use-system-ca",
+        action="store_true",
+        dest="use_system_ca",
+        help="Trust certificates in the OS CA store (Node.js 24+; useful for self-signed certs already installed system-wide)",
+    )
     setup.set_defaults(func=cmd_setup)
 
     status = sub.add_parser("status", help="Show config + binary + last fetch")
@@ -149,16 +164,59 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "  [green]✓[/green] using default (https://vault.bitwarden.com)"
         )
 
+    # -------------------------------------------------------------------- TLS
+    console.print()
+    console.print("[bold]Step 3b[/bold]  TLS certificate configuration")
+    # Collect ca_cert
+    ca_cert = (getattr(args, "ca_cert", None) or "").strip()
+    insecure_tls = bool(getattr(args, "insecure", False))
+    use_system_ca = bool(getattr(args, "use_system_ca", False))
+    if not ca_cert and not insecure_tls and not use_system_ca:
+        existing_ca = secrets_cfg.get("ca_cert", "")
+        existing_sys_ca = bool(secrets_cfg.get("use_system_ca", False))
+        default_label = existing_ca if existing_ca else "(none)"
+        ca_input = console.input(
+            f"  CA certificate path (PEM) for self-signed TLS [{default_label}]: "
+        ).strip()
+        ca_cert = ca_input or existing_ca
+        if not ca_cert and not existing_sys_ca:
+            sys_ca_input = console.input(
+                "  Use OS trust store (--use-system-ca, Node 24+)? [y/N]: "
+            ).strip().lower()
+            use_system_ca = sys_ca_input in ("y", "yes")
+        elif existing_sys_ca and not ca_cert:
+            use_system_ca = existing_sys_ca
+
+    if ca_cert:
+        ca_cert = str(Path(ca_cert).expanduser())
+        if not Path(ca_cert).is_file():
+            console.print(
+                f"  [red]✗ CA cert file not found: {ca_cert}[/red]\n"
+                "  [yellow]Provide the absolute path to a PEM file, or leave blank to skip.[/yellow]"
+            )
+            return 1
+        console.print(f"  [green]✓[/green] CA cert: {ca_cert}")
+    elif insecure_tls:
+        console.print(
+            "  [yellow]⚠ TLS verification disabled — use only on trusted networks.[/yellow]"
+        )
+    elif use_system_ca:
+        console.print("  [green]✓[/green] Using OS trust store (--use-system-ca)")
+    else:
+        console.print("  [green]✓[/green] Using system default CA bundle")
+
+    tls_env = bwv._tls_env_vars(ca_cert, insecure_tls, use_system_ca)
+
     # ----------------------------------------------------------------- login check
     console.print()
     console.print("[bold]Step 4[/bold]  Login & master password")
 
     # Configure server first if needed
     if server_url:
-        bwv._configure_server(binary, server_url)
+        bwv._configure_server(binary, server_url, tls_env=tls_env)
 
     # Check if already logged in
-    status = bwv._check_status(binary)
+    status = bwv._check_status(binary, tls_env=tls_env)
     vault_status = status.get("status", "unauthenticated")
 
     if vault_status == "unauthenticated":
@@ -167,7 +225,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "  [yellow]Note: If 2FA is enabled, you'll be prompted for it.[/yellow]"
         )
         # Interactive login — we can't do this fully non-interactively with 2FA
-        login_result = _interactive_login(binary, email, console)
+        login_result = _interactive_login(binary, email, console, tls_env=tls_env)
         if not login_result:
             return 1
         console.print("  [green]✓[/green] Logged in successfully")
@@ -193,7 +251,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             f.write(master_pw)
         os.chmod(pw_file, 0o600)
 
-        proc = bwv._run_bw(binary, ["unlock", "--passwordfile", pw_file])
+        proc = bwv._run_bw(binary, ["unlock", "--passwordfile", pw_file], env_extra=tls_env)
     finally:
         try:
             os.unlink(pw_file)
@@ -228,8 +286,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     if not folder_name:
         # List existing folders
+        folders: list = []
         try:
-            folders = bwv._list_folders(binary, session)
+            folders = bwv._list_folders(binary, session, tls_env=tls_env)
             if folders:
                 table = Table(show_header=True, header_style="bold")
                 table.add_column("#", style="cyan", width=4)
@@ -238,24 +297,41 @@ def cmd_setup(args: argparse.Namespace) -> int:
                     name = f.get("name") or "(unnamed)"
                     table.add_row(str(i), name)
                 console.print(table)
+                console.print(
+                    "  [dim]Enter a number to pick from the list, "
+                    "or type any name to use/create that folder.[/dim]"
+                )
         except Exception:  # noqa: BLE001
             folders = []
 
         existing_folder = secrets_cfg.get("folder_name", "hermes")
         folder_input = console.input(
-            f"  Folder name [{existing_folder}]: "
+            f"  Folder name or # [{existing_folder}]: "
         ).strip()
-        folder_name = folder_input or existing_folder
+
+        if not folder_input:
+            folder_name = existing_folder
+        elif folder_input.isdigit():
+            idx = int(folder_input) - 1
+            if 0 <= idx < len(folders):
+                folder_name = folders[idx].get("name") or existing_folder
+            else:
+                console.print(
+                    f"  [red]Number {folder_input} is out of range.[/red]"
+                )
+                return 1
+        else:
+            folder_name = folder_input
 
     # Verify folder exists
-    folder_id = bwv._find_folder_id(binary, session, folder_name)
+    folder_id = bwv._find_folder_id(binary, session, folder_name, tls_env=tls_env)
     if folder_id is None:
         console.print(
             f"  [yellow]Folder '{folder_name}' not found.[/yellow]"
         )
         create = console.input("  Create it? [Y/n]: ").strip().lower()
         if create in ("", "y", "yes"):
-            folder_id = _create_folder(binary, session, folder_name, console)
+            folder_id = _create_folder(binary, session, folder_name, console, tls_env=tls_env)
             if folder_id is None:
                 return 1
         else:
@@ -268,7 +344,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     console.print()
     console.print("[bold]Step 7[/bold]  Test fetch")
     try:
-        items = bwv._list_items_in_folder(binary, session, folder_id)
+        items = bwv._list_items_in_folder(binary, session, folder_id, tls_env=tls_env)
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
         return 1
@@ -304,6 +380,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg["email"] = email
     secrets_cfg["folder_name"] = folder_name
     secrets_cfg["server_url"] = server_url
+    secrets_cfg["ca_cert"] = ca_cert
+    secrets_cfg["insecure_tls"] = insecure_tls
+    secrets_cfg["use_system_ca"] = use_system_ca
     secrets_cfg.setdefault("cache_ttl_seconds", 86400)
     secrets_cfg.setdefault("override_existing", False)
     secrets_cfg.setdefault("auto_install", True)
@@ -333,6 +412,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     email = bwv_cfg.get("email", "")
     folder_name = bwv_cfg.get("folder_name", "hermes")
     server_url = str(bwv_cfg.get("server_url", "") or "").strip()
+    ca_cert = str(bwv_cfg.get("ca_cert", "") or "").strip()
+    insecure_tls = bool(bwv_cfg.get("insecure_tls", False))
+    use_system_ca = bool(bwv_cfg.get("use_system_ca", False))
     password_storage = bwv_cfg.get("password_storage", "auto")
     org_id = bwv_cfg.get("org_id", "")
 
@@ -345,6 +427,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row(
         "Server URL",
         server_url or "[dim]default (https://vault.bitwarden.com)[/dim]",
+    )
+    table.add_row(
+        "CA certificate",
+        ca_cert or "[dim]system default[/dim]",
+    )
+    table.add_row(
+        "Use OS trust store",
+        "[green]yes[/green]" if use_system_ca else "[dim]no[/dim]",
+    )
+    table.add_row(
+        "Insecure TLS",
+        "[yellow]yes (verification disabled)[/yellow]" if insecure_tls else "[dim]no[/dim]",
     )
     table.add_row("Password storage", password_storage)
     table.add_row("Organization ID", org_id or "[dim](personal vault)[/dim]")
@@ -423,6 +517,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     api_url = str(bwv_cfg.get("api_url", "") or "").strip()
     org_id = str(bwv_cfg.get("org_id", "") or "").strip()
     password_storage = bwv_cfg.get("password_storage", "auto")
+    ca_cert = str(bwv_cfg.get("ca_cert", "") or "").strip()
+    insecure_tls = bool(bwv_cfg.get("insecure_tls", False))
+    use_system_ca = bool(bwv_cfg.get("use_system_ca", False))
 
     from hermes_constants import get_hermes_home
     home_path = get_hermes_home()
@@ -438,6 +535,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
             org_id=org_id,
             home_path=home_path,
             password_storage=password_storage,
+            ca_cert=ca_cert,
+            insecure_tls=insecure_tls,
+            use_system_ca=use_system_ca,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
@@ -531,7 +631,8 @@ def _bw_version(binary: Path) -> str:
 
 
 def _interactive_login(
-    binary: Path, email: str, console: Console
+    binary: Path, email: str, console: Console,
+    tls_env: Optional[dict] = None,
 ) -> bool:
     """Run bw login interactively (handles 2FA prompts)."""
     import sys
@@ -539,6 +640,8 @@ def _interactive_login(
     cmd = [str(binary), "login", email, "--nointeraction"]
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    if tls_env:
+        env.update(tls_env)
 
     # For interactive login with potential 2FA, we need to let
     # stdin/stdout pass through
@@ -565,7 +668,8 @@ def _interactive_login(
 
 
 def _create_folder(
-    binary: Path, session: str, folder_name: str, console: Console
+    binary: Path, session: str, folder_name: str, console: Console,
+    tls_env: Optional[dict] = None,
 ) -> Optional[str]:
     """Create a new folder in the vault and return its ID."""
     import base64
@@ -578,6 +682,8 @@ def _create_folder(
     cmd = [str(binary), "create", "folder", encoded, "--nointeraction", "--session", session]
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    if tls_env:
+        env.update(tls_env)
 
     try:
         proc = subprocess.run(
