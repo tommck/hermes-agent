@@ -88,8 +88,9 @@ def _cache_key_str(cache_key: _CacheKey) -> str:
     return f"{email_hash}|{folder_name}|{server_url}"
 
 
-def _read_disk_cache(cache_key: _CacheKey, ttl_seconds: float,
-                     home_path: Optional[Path] = None) -> Optional["_CachedFetch"]:
+def _read_disk_cache(
+    cache_key: _CacheKey, ttl_seconds: float, home_path: Optional[Path] = None
+) -> Optional["_CachedFetch"]:
     if ttl_seconds <= 0:
         return None
     path = _disk_cache_path(home_path)
@@ -115,8 +116,9 @@ def _read_disk_cache(cache_key: _CacheKey, ttl_seconds: float,
     return entry
 
 
-def _write_disk_cache(cache_key: _CacheKey, entry: "_CachedFetch",
-                      home_path: Optional[Path] = None) -> None:
+def _write_disk_cache(
+    cache_key: _CacheKey, entry: "_CachedFetch", home_path: Optional[Path] = None
+) -> None:
     path = _disk_cache_path(home_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +184,7 @@ class FetchResult:
 
 def _hermes_bin_dir() -> Path:
     from hermes_constants import get_hermes_home
+
     return get_hermes_home() / "bin"
 
 
@@ -227,9 +230,7 @@ def _platform_asset_name() -> str:
     if system == "Linux":
         return f"bw-linux-{_BW_VERSION}.zip"
 
-    raise RuntimeError(
-        f"Unsupported platform for bw auto-install: {system}"
-    )
+    raise RuntimeError(f"Unsupported platform for bw auto-install: {system}")
 
 
 def install_bw(*, force: bool = False) -> Path:
@@ -258,8 +259,7 @@ def install_bw(*, force: bool = False) -> Path:
         actual = _sha256_file(zip_path)
         if expected.lower() != actual.lower():
             raise RuntimeError(
-                f"Checksum mismatch for {asset_name}: "
-                f"expected {expected}, got {actual}"
+                f"Checksum mismatch for {asset_name}: expected {expected}, got {actual}"
             )
 
         with zipfile.ZipFile(zip_path) as zf:
@@ -272,9 +272,13 @@ def install_bw(*, force: bool = False) -> Path:
         shutil.copy2(extracted, staged)
         os.chmod(
             staged,
-            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-            | stat.S_IRGRP | stat.S_IXGRP
-            | stat.S_IROTH | stat.S_IXOTH,
+            stat.S_IRUSR
+            | stat.S_IWUSR
+            | stat.S_IXUSR
+            | stat.S_IRGRP
+            | stat.S_IXGRP
+            | stat.S_IROTH
+            | stat.S_IXOTH,
         )
         os.replace(staged, target)
 
@@ -298,9 +302,7 @@ def _expected_sha256(checksum_file: Path, asset_name: str) -> str:
         parts = line.strip().split()
         if len(parts) >= 2 and parts[-1] == asset_name:
             return parts[0]
-    raise RuntimeError(
-        f"No checksum entry for {asset_name} in {checksum_file.name}"
-    )
+    raise RuntimeError(f"No checksum entry for {asset_name} in {checksum_file.name}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -362,6 +364,7 @@ def _read_from_keyring(email: str) -> Optional[str]:
     """Try to read password from OS keychain."""
     try:
         import keyring as kr
+
         pw = kr.get_password(_KEYRING_SERVICE, email)
         return pw if pw else None
     except Exception:  # noqa: BLE001
@@ -372,6 +375,7 @@ def _write_to_keyring(email: str, password: str) -> bool:
     """Store password in OS keychain. Returns True on success."""
     try:
         import keyring as kr
+
         kr.set_password(_KEYRING_SERVICE, email, password)
         return True
     except Exception:  # noqa: BLE001
@@ -391,9 +395,7 @@ def _write_to_file(password: str, home_path: Optional[Path] = None) -> Path:
     """Write password to file with mode 0600."""
     path = _password_file_path(home_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".bw_pw_", suffix=".tmp"
-    )
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".bw_pw_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(password)
@@ -592,9 +594,7 @@ def _list_folders(bw: Path, session: str) -> List[dict]:
     return folders if isinstance(folders, list) else []
 
 
-def _find_folder_id(
-    bw: Path, session: str, folder_name: str
-) -> Optional[str]:
+def _find_folder_id(bw: Path, session: str, folder_name: str) -> Optional[str]:
     """Find the folder ID for the given folder name."""
     folders = _list_folders(bw, session)
     for folder in folders:
@@ -608,10 +608,14 @@ def _list_items_in_folder(
 ) -> List[dict]:
     """List items in a specific folder."""
     cmd = [
-        str(bw), "list", "items",
-        "--folderid", folder_id,
+        str(bw),
+        "list",
+        "items",
+        "--folderid",
+        folder_id,
         "--nointeraction",
-        "--session", session,
+        "--session",
+        session,
     ]
     if org_id:
         cmd.extend(["--organizationid", org_id])
@@ -737,9 +741,7 @@ def fetch_vault_secrets(
         if not isinstance(name, str):
             continue
         if not _is_valid_env_name(name):
-            warnings.append(
-                f"Skipping item {name!r}: not a valid env-var name"
-            )
+            warnings.append(f"Skipping item {name!r}: not a valid env-var name")
             continue
         value = _extract_secret_value(item)
         if value is None:
