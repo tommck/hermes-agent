@@ -176,7 +176,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         existing_sys_ca = bool(secrets_cfg.get("use_system_ca", False))
         default_label = existing_ca if existing_ca else "(none)"
         ca_input = console.input(
-            f"  CA certificate path (PEM) for self-signed TLS [{default_label}]: "
+            f"  CA certificate path (PEM) for self-signed TLS [{default_label}]: ",
+            markup=False,
         ).strip()
         ca_cert = ca_input or existing_ca
         if not ca_cert and not existing_sys_ca:
@@ -190,12 +191,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if ca_cert:
         ca_cert = str(Path(ca_cert).expanduser())
         if not Path(ca_cert).is_file():
+            from rich.markup import escape as _escape
             console.print(
-                f"  [red]✗ CA cert file not found: {ca_cert}[/red]\n"
+                f"  [red]✗ CA cert file not found: {_escape(ca_cert)}[/red]\n"
                 "  [yellow]Provide the absolute path to a PEM file, or leave blank to skip.[/yellow]"
             )
             return 1
-        console.print(f"  [green]✓[/green] CA cert: {ca_cert}")
+        from rich.markup import escape as _escape
+        console.print(f"  [green]✓[/green] CA cert: {_escape(ca_cert)}")
     elif insecure_tls:
         console.print(
             "  [yellow]⚠ TLS verification disabled — use only on trusted networks.[/yellow]"
@@ -428,9 +431,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         "Server URL",
         server_url or "[dim]default (https://vault.bitwarden.com)[/dim]",
     )
+    from rich.markup import escape as _escape
     table.add_row(
         "CA certificate",
-        ca_cert or "[dim]system default[/dim]",
+        _escape(ca_cert) if ca_cert else "[dim]system default[/dim]",
     )
     table.add_row(
         "Use OS trust store",
