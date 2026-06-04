@@ -11408,11 +11408,11 @@ def main():
     # =========================================================================
     secrets_parser = subparsers.add_parser(
         "secrets",
-        help="Manage external secret sources (Bitwarden Secrets Manager)",
+        help="Manage external secret sources (Bitwarden Secrets Manager, Bitwarden Vault)",
         description=(
             "Pull API keys from an external secret manager at process startup "
             "instead of storing them in ~/.hermes/.env.  Currently supports "
-            "Bitwarden Secrets Manager.  See: "
+            "Bitwarden Secrets Manager and Bitwarden Vault.  See: "
             "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/bitwarden"
         ),
     )
@@ -11429,10 +11429,23 @@ def main():
 
     _secrets_cli.register_cli(secrets_bw)
 
+    secrets_bwv = secrets_subparsers.add_parser(
+        "bitwarden-vault",
+        aliases=["bw-vault"],
+        help="Bitwarden Vault (password manager) integration",
+    )
+
+    from hermes_cli import secrets_cli_vault as _secrets_cli_vault
+
+    _secrets_cli_vault.register_cli(secrets_bwv)
+
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
+        bwv_sub = getattr(args, "secrets_bwv_command", None)
         if sub in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if sub in ("bitwarden-vault", "bw-vault") and bwv_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0

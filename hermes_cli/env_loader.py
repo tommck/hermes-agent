@@ -78,6 +78,8 @@ def format_secret_source_suffix(env_var: str) -> str:
         return ""
     if source == "bitwarden":
         return " (from Bitwarden)"
+    if source == "bitwarden_vault":
+        return " (from Bitwarden Vault)"
     # Generic fallback — future-proofing for additional secret sources
     # (e.g. 1Password, HashiCorp Vault) without having to update every
     # call site.
@@ -321,6 +323,50 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             f"  Bitwarden Secrets Manager: {warn}",
             file=sys.stderr,
         )
+
+    # --- Bitwarden Vault (bw CLI) ---
+    bwv_cfg = (cfg or {}).get("bitwarden_vault") or {}
+    if bwv_cfg.get("enabled"):
+        try:
+            from agent.secret_sources.bitwarden_vault import apply_vault_secrets
+        except ImportError:
+            pass
+        else:
+            vault_result = apply_vault_secrets(
+                enabled=True,
+                email=str(bwv_cfg.get("email", "") or "").strip(),
+                folder_name=str(bwv_cfg.get("folder_name", "hermes") or "hermes"),
+                override_existing=bool(bwv_cfg.get("override_existing", False)),
+                cache_ttl_seconds=float(bwv_cfg.get("cache_ttl_seconds", 86400)),
+                auto_install=bool(bwv_cfg.get("auto_install", True)),
+                server_url=str(bwv_cfg.get("server_url", "") or "").strip(),
+                identity_url=str(bwv_cfg.get("identity_url", "") or "").strip(),
+                api_url=str(bwv_cfg.get("api_url", "") or "").strip(),
+                org_id=str(bwv_cfg.get("org_id", "") or "").strip(),
+                home_path=home_path,
+                password_storage=str(bwv_cfg.get("password_storage", "auto") or "auto"),
+            )
+
+            if vault_result.applied:
+                _sanitize_loaded_credentials()
+                for name in vault_result.applied:
+                    _SECRET_SOURCES[name] = "bitwarden_vault"
+                print(
+                    f"  Bitwarden Vault: applied {len(vault_result.applied)} "
+                    f"secret{'s' if len(vault_result.applied) != 1 else ''} "
+                    f"({', '.join(sorted(vault_result.applied))})",
+                    file=sys.stderr,
+                )
+            if vault_result.error:
+                print(
+                    f"  Bitwarden Vault: {vault_result.error}",
+                    file=sys.stderr,
+                )
+            for warn in vault_result.warnings:
+                print(
+                    f"  Bitwarden Vault: {warn}",
+                    file=sys.stderr,
+                )
 
 
 def _load_secrets_config(home_path: Path) -> dict:
